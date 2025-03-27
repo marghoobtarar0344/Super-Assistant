@@ -1,5 +1,5 @@
 import json
-from typing import AsyncGenerator, Dict, Any, Optional
+from typing import AsyncGenerator, Dict, Any, Optional,Generator
 from llm import GroqService
 from tools.weather import WeatherService
 from tools.appointment import AppointmentService
@@ -83,10 +83,31 @@ class SSEService:
             }
         ]
 
-    async def generate_response(self, query: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Handles complete SSE streaming with all tools"""
+    def _create_sse_event(self, event_type: str, data: Any) -> str:
+        """Creates SSE events with guaranteed correct formatting"""
+        # Ensure we never get empty event types
+        event_type = event_type.strip() if event_type else "message"
+        
+        # Handle data formatting
+        if isinstance(data, str):
+            # Remove any existing SSE formatting
+            # data = data.replace("data: ", "").replace("event: ", "").strip()
+            # If it looks like JSON, parse and re-stringify to ensure validity
+            if data.startswith("{") and data.endswith("}"):
+                try:
+                    data = json.dumps(json.loads(data))
+                except json.JSONDecodeError:
+                    pass
+        else:
+            # Convert non-string data to JSON
+            data = json.dumps(data)
+        
+        # Return clean SSE format (single newline at end)
+        print('here are event',f"event: {event_type}\ndata: {data} \n")
+        return f"event: {event_type}\ndata: {data} \n".encode('utf-8')
+    async def generate_response(self, query: str) -> AsyncGenerator[str, None]:
         try:
-            # Initialize Groq stream 
+            # Initialize stream
             stream = self.groq.get_client().chat.completions.create(
                 messages=[{"role": "user", "content": query}],
                 model=Config.MODEL_NAME,
@@ -97,85 +118,78 @@ class SSEService:
 
             tool_calls = []
             
-            # Process initial stream 
+            # Process initial stream with raw output
             for chunk in stream:
-                processed = self._process_chunk(chunk, tool_calls)
-                if processed is not None:
-                    yield processed
+                if not chunk.choices or not chunk.choices[0].delta:
+                    continue
+                    
+                delta = chunk.choices[0].delta
+                
+                if delta.content:
+                    content = delta.content.strip()
+                    if content:
+                        print('here is chunk 2',self._create_sse_event("chunk", content))
+                        yield self._create_sse_event("chunk", content)
+                
+                elif delta.tool_calls:
+                    for tool_call in delta.tool_calls:
+                        if tool_call.function:
+                            tool_calls.append({
+                                "id": tool_call.id,
+                                "name": tool_call.function.name,
+                                "args": tool_call.function.arguments
+                            })
+                            yield self._create_sse_event("tool_use", {
+                                "name": tool_call.function.name,
+                                "parameters": str(json.loads(tool_call.function.arguments))
+                            })
             
-            # Process tool calls 
+            # Process tool calls
             for tool in tool_calls:
-                async for event in self._handle_tool_execution(tool, query):
-                    yield event
+                try:
+                    result = await self._execute_tool(tool["name"], json.loads(tool["args"]))
+                    # yield self._create_sse_event("tool_output", {
+                    #     "name": tool["name"],
+                    #     "output": result if isinstance(result, dict) else {"result": str(result)},
+                    #     "success": True
+                    # })
+                    
+                    # Get follow-up response
+                    follow_up = self.groq.get_client().chat.completions.create(
+                        messages=[
+                            {"role": "user", "content": query},
+                            {
+                                "role": "tool",
+                                "name": tool["name"],
+                                "content": json.dumps(result),
+                                "tool_call_id": tool["id"]
+                            }
+                        ],
+                        model=Config.MODEL_NAME,
+                        stream=True
+                    )
+                    
+                    for chunk in follow_up:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            content = chunk.choices[0].delta.content.strip()
+                            if content:
+                                yield self._create_sse_event("chunk", content)
+                
+                except Exception as tool_error:
+                    yield self._create_sse_event("tool_output", {
+                        "name": tool["name"],
+                        "output": {"error": str(tool_error)},
+                        "success": False
+                    })
 
         except Exception as e:
-            yield {"event": "error", "data": str(e)}
+            yield self._create_sse_event("error", {"message": str(e)})
         finally:
-            yield {"event": "end", "data": ""}
+            yield self._create_sse_event("end", {})
 
-    def _process_chunk(self, chunk, tool_calls: list) -> Optional[Dict[str, Any]]:
-        """Processes a single stream chunk"""
-        if not (chunk.choices and chunk.choices[0].delta):
-            return None
-            
-        delta = chunk.choices[0].delta
-        
-        if delta.content:
-            return {"event": "chunk", "data": delta.content}
-        
-        if delta.tool_calls:
-            for tool_call in delta.tool_calls:
-                if tool_call.function:
-                    tool_calls.append({
-                        "id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "args": tool_call.function.arguments
-                    })
-                    return {
-                        "event": "tool_use",
-                        "data": json.dumps({
-                            "name": tool_call.function.name,
-                            "parameters": json.loads(tool_call.function.arguments)
-                        })
-                    }
-        return None
-
-    async def _handle_tool_execution(self, tool: Dict[str, Any], query: str) -> AsyncGenerator[Dict[str, Any], None]:
-        """Executes tool and streams follow-up response"""
-        # Execute the tool
-        result = await self._execute_tool(tool["name"], json.loads(tool["args"]))
-        
-        # Yield tool output
-        yield {
-            "event": "tool_output",
-            "data": json.dumps({
-                "name": tool["name"],
-                "output": result
-            })
-        }
-        
-        # Get follow-up response (synchronous stream)
-        follow_up = self.groq.get_client().chat.completions.create(
-            messages=[
-                {"role": "user", "content": query},
-                {
-                    "role": "tool",
-                    "name": tool["name"],
-                    "content": json.dumps(result),
-                    "tool_call_id": tool["id"]
-                }
-            ],
-            model=Config.MODEL_NAME,
-            stream=True
-        )
-        
-        # Process follow-up chunks 
-        for chunk in follow_up:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield {"event": "chunk", "data": chunk.choices[0].delta.content}
 
     async def _execute_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Routes to the correct tool implementation"""
+        """Async tool execution"""
         tool_mapping = {
             "get_weather": self.tools_weather.get_weather,
             "get_dealership_address": self.tools_dealer.get_dealership_address,
@@ -186,4 +200,40 @@ class SSEService:
         if tool_name not in tool_mapping:
             raise ValueError(f"Unknown tool: {tool_name}")
         
-        return await tool_mapping[tool_name](**params)
+        result = await tool_mapping[tool_name](**params)
+        return result if isinstance(result, dict) else {"result": result}
+    
+    def _process_chunk(self, chunk, tool_calls: list) -> Optional[Dict[str, Any]]:
+        """Processes synchronous stream chunks and prevents duplicate outputs."""
+        if not (chunk.choices and chunk.choices[0].delta):
+            return None
+
+        delta = chunk.choices[0].delta
+
+        if delta.content and delta.content.strip():
+            processed_data = {"event": "chunk", "data": delta.content.strip()}
+            print(f"DEBUG: _process_chunk - {processed_data}")  # 🔍 Debugging
+            return processed_data
+
+        if delta.tool_calls:
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    tool_calls.append({
+                        "id": tool_call.id,
+                        "name": tool_call.function.name,
+                        "args": tool_call.function.arguments
+                    })
+                    tool_use_data = {
+                        "event": "tool_use",
+                        "data": json.dumps({
+                            "name": tool_call.function.name,
+                            "parameters": str(json.loads(tool_call.function.arguments))
+                        })
+                    }
+                    print(f"DEBUG: _process_chunk - {tool_use_data}")  # 🔍 Debugging
+                    return tool_use_data
+
+        return None  # Ignore empty chunks
+
+    
+    
