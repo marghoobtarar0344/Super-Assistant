@@ -85,14 +85,10 @@ class SSEService:
 
     def _create_sse_event(self, event_type: str, data: Any) -> str:
         """Creates SSE events with guaranteed correct formatting"""
-        # Ensure we never get empty event types
         event_type = event_type.strip() if event_type else "message"
         
         # Handle data formatting
         if isinstance(data, str):
-            # Remove any existing SSE formatting
-            # data = data.replace("data: ", "").replace("event: ", "").strip()
-            # If it looks like JSON, parse and re-stringify to ensure validity
             if data.startswith("{") and data.endswith("}"):
                 try:
                     data = json.dumps(json.loads(data))
@@ -103,7 +99,7 @@ class SSEService:
             data = json.dumps(data)
         
         # Return clean SSE format (single newline at end)
-        print('here are event',f"event: {event_type}\ndata: {data} \n")
+        # print('here are event',f"event: {event_type}\ndata: {data} \n")
         return f"event: {event_type}\ndata: {data} \n".encode('utf-8')
     async def generate_response(self, query: str) -> AsyncGenerator[str, None]:
         try:
