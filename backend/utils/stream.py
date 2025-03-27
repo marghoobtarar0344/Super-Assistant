@@ -226,7 +226,7 @@ class SSEService:
                             "parameters": str(json.loads(tool_call.function.arguments))
                         })
                     }
-                    print(f"DEBUG: _process_chunk - {tool_use_data}")  # 🔍 Debugging
+                    print(f"DEBUG: _process_chunk - {tool_use_data}")  
                     return tool_use_data
 
         return None  # Ignore empty chunks
